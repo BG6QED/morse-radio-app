@@ -1,0 +1,2453 @@
+const Constants = {
+    SERVER_BASE_URL: 'wss://cw.438900.xyz',
+    SCROLL_DELAY: 20,
+    KNOB_DAMPING: 0.6,
+    FREQUENCY_UPDATE_THROTTLE: 50,
+    TIME_BROADCAST_BAND: '40m',
+    TIME_BROADCAST_FREQUENCY: 7.003,
+    SIGNAL_TIMEOUT: 1000,
+
+    DOT_DURATION: 100,
+    DASH_DURATION: 300,
+    ELEMENT_GAP: 100,
+    CHARACTER_GAP: 300,
+    WORD_GAP: 700,
+
+    BANDS: [
+        { name: "160m", min: 1.800, max: 1.860, code: "160" },
+        { name: "80m", min: 3.500, max: 3.525, code: "80" },
+        { name: "40m", min: 7.000, max: 7.030, code: "40" },
+        { name: "30m", min: 10.100, max: 10.140, code: "30" },
+        { name: "20m", min: 14.000, max: 14.070, code: "20" },
+        { name: "17m", min: 18.068, max: 18.100, code: "17" },
+        { name: "15m", min: 21.000, max: 21.070, code: "15" },
+        { name: "12m", min: 24.890, max: 24.930, code: "12" },
+        { name: "10m", min: 28.000, max: 28.070, code: "10" },
+        { name: "6m", min: 50.000, max: 50.100, code: "6" },
+        { name: "2m", min: 144.000, max: 144.100, code: "2" },
+        { name: "70cm", min: 430.000, max: 430.100, code: "70" }
+    ],
+
+    NETWORK: {
+        RECONNECT_BACKOFF: 1000,
+        MAX_RECONNECT_DELAY: 30000,
+    },
+
+    SIGNAL_PROCESSING: {
+        FREQUENCY_TOLERANCE: 0.0001,
+        TIME_SIGNAL_TOLERANCE: 0.0001,
+        DECODE_CONFIDENCE_THRESHOLD: 0.7,
+        RETRY_DECODE_ATTEMPTS: 3,
+        CLIENT_TONE_VARIATION: 50,
+        SIGNAL_MERGE_THRESHOLD: 0.001,
+        SIGNAL_CONTINUITY_THRESHOLD: 50,
+        SIGNAL_GAP_THRESHOLD: 500
+    },
+
+    NOISE: {
+        QRN_LEVEL: 0.1, // 自然噪声基础水平 (0-1)
+        QRM_LEVEL: 0.2, // 人为干扰基础水平 (0-1)
+        QSB_FREQUENCY: 0.01, // 信号衰落频率 (Hz)
+        QSB_DEPTH: 0.5, // 信号衰落深度 (0-1)
+        QRM_INTERVAL_MIN: 2000, // 最小干扰间隔 (ms)
+        QRM_INTERVAL_MAX: 8000, // 最大干扰间隔 (ms)
+        QRM_DURATION_MIN: 500, // 最小干扰持续时间 (ms)
+        QRM_DURATION_MAX: 3000, // 最大干扰持续时间 (ms)
+        QRM_FREQ_VARIANCE: 0.02 // 干扰频率变化范围 (MHz)
+    }
+};
+
+const MorseCodeMap = {
+    '.-': 'A', '-...': 'B', '-.-.': 'C', '-..': 'D', '.': 'E',
+    '..-.': 'F', '--.': 'G', '....': 'H', '..': 'I', '.---': 'J',
+    '-.-': 'K', '.-..': 'L', '--': 'M', '-.': 'N', '---': 'O',
+    '.--.': 'P', '--.-': 'Q', '.-.': 'R', '...': 'S', '-': 'T',
+    '..-': 'U', '...-': 'V', '.--': 'W', '-..-': 'X', '-.--': 'Y',
+    '--..': 'Z', '-----': '0', '.----': '1', '..---': '2', '...--': '3',
+    '....-': '4', '.....': '5', '-....': '6', '--...': '7', '---..': '8',
+    '----.': '9', '/': ' ', '.-.-.-': '.', '--..--': ',', '---...': ':',
+    '..--..': '?', '.----.': "'", '-....-': '-', '-..-.': '/', '-.--.': '(',
+    '-.--.-': ')', '.-..-.': '"', '-...-': '=', '...-..-': '$', '.--.-.': '@'
+};
+
+const State = (() => {
+    const state = {
+        justConnected: false,
+        pendingRelease: false,
+        currentBandIndex: 2,
+        previousBandIndex: 2,
+        previousFrequency: 0,
+        isManualMode: true,
+        wpm: 20,
+        keyer: {
+            paddleDotPressed: false,
+            paddleDashPressed: false,
+            running: false,
+            nextIsDot: true,
+            loopTimer: null,
+            gapTimer: null,
+            dotPressedAt: 0,
+            dashPressedAt: 0
+        },
+        isTransmitting: false,
+        isMuted: false,
+        isSearching: false,
+        audioContext: null,
+        oscillator: null,
+        gainNode: null,
+        masterGain: null,
+        receivedGain: null,
+        qsbGain: null,
+        volume: 0.7,
+        toneFrequency: 800,
+        waterfallChart: null,
+        frequencyKnobRotation: 0,
+        volumeKnobRotation: 252,
+        toneKnobRotation: 144,
+        isDraggingFrequency: false,
+        isDraggingVolume: false,
+        isDraggingTone: false,
+        startAngle: 0,
+        ws: null,
+        txWs: null,
+        signalHistory: {},
+        lastFrequencyUpdate: 0,
+        signalBuffer: [],
+        scrollInterval: null,
+        lastSignalTime: 0,
+        currentFrequency: 0,
+        isReceivingTimeBroadcast: false,
+        timeBroadcastBuffer: [],
+        lastSignalTimestamp: 0,
+        clientId: Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15),
+        transmitStartTime: null,
+        activeRemoteSignals: new Map(), 
+        transmitInterval: null,
+        timeBroadcastTimeout: null,
+        timeBroadcastDecodeTimeout: null,
+        isDrawingTimeSignal: false,
+        timeSignalDrawTimeout: null,
+        lastActivityTime: 0,
+        searchBandIndex: 0,
+        searchTimeout: null,
+        foundSignal: null,
+        timeBroadcast: {
+            lastSyncTime: 0,
+            confidence: 0,
+            lastValidTime: null
+        },
+        isLongPressBlocked: false,
+        noiseGenerator: null,
+        noiseGain: null,
+        qrmOscillator: null,
+        qrmGain: null,
+        qrmRFfreq: null,
+        qsbFactor: 1,
+        isQrmActive: false,
+        qrmInterval: null,
+        qsbInterval: null,
+        currentQrmId: null,
+        currentQrmInterval: null,
+        timers: new Set() 
+    };
+    function initSignalHistory() {
+        Constants.BANDS.forEach(band => {
+            state.signalHistory[band.name] = {};
+        });
+    }
+    function addTimer(timerId) {
+        state.timers.add(timerId);
+    }
+    function clearTimers() {
+        state.timers.forEach(id => clearTimeout(id) || clearInterval(id));
+        state.timers.clear();
+    }
+    return {
+        init: initSignalHistory,
+        get: (key) => state[key],
+        set: (key, value) => { state[key] = value; },
+        update: (newState) => { Object.assign(state, newState); },
+        getAll: () => ({ ...state }),
+        addTimer,
+        clearTimers
+    };
+})();
+
+const DOM = (() => {
+    const elements = {};
+ 
+    const elementIds = [
+        'bandSelect', 'frequencyDigits', 'frequencyScale', 'waterfallCanvas',
+        'frequencyKnob', 'volumeKnob', 'toneKnob', 'muteButton', 'morseKey',
+        'connectionStatus', 'toneValue', 'searchButton', 'searchModal',
+        'searchProgress', 'searchStatus', 'noSignalMessage', 'keyHintManual',
+        'volumeValue', 'frequencyIndicator', 'timeBroadcastIndicator',
+        'decodedTimeDisplay', 'audioActivationPrompt', 'testAudioButton', 'keyHintAuto',
+        'modeToggle', 'wpmSlider', 'wpmGroup', 'modeLabel', 'wpmValue',
+        'paddleKeyer'
+    ];
+ 
+    elementIds.forEach(id => {
+        elements[id] = document.getElementById(id);
+    });
+    elements['reminderModal'] = document.getElementById('reminderModal');
+    elements['rogerButton'] = document.getElementById('rogerButton');
+    return {
+        get: (id) => elements[id],
+        updateText: (id, text) => { if (elements[id]) elements[id].textContent = text; },
+        updateStyle: (id, prop, value) => { if (elements[id]) elements[id].style[prop] = value; },
+        toggleClass: (id, className, add = true) => {
+            if (elements[id]) elements[id].classList[add ? 'add' : 'remove'](className);
+        }
+    };
+})();
+
+const KnobHandler = (() => {
+    const handlers = {
+        frequency: {
+            min: 0,
+            max: 360,
+            getValue: (rotation) => {
+                const band = Constants.BANDS[State.get('currentBandIndex')];
+                const range = band.max - band.min;
+                const positionInRange = ((rotation % 360) + 360) % 360 / 360;
+                return band.min + (positionInRange * range);
+            },
+            setValue: (value) => {
+                State.set('currentFrequency', parseFloat(value.toFixed(3)));
+                Audio.updateQrmTone();
+                Audio.stopTransmitting();
+                UI.updateFrequencyDisplay();
+                UI.updateFrequencyIndicatorPosition();
+            },
+            throttle: Constants.FREQUENCY_UPDATE_THROTTLE,
+            tolerance: 0.002
+        },
+        volume: {
+            min: 0,
+            max: 1,
+            getValue: (rotation) => ((rotation % 360) + 360) % 360 / 360,
+            setValue: (value) => {
+                State.set('volume', value);
+                const gainNode = State.get('gainNode');
+                const receivedGain = State.get('receivedGain');
+                const audioContext = State.get('audioContext');
+                if (gainNode && audioContext) {
+                    if (State.get('isTransmitting')) {
+                        gainNode.gain.linearRampToValueAtTime(value, audioContext.currentTime + 0.01);
+                    } else {
+                        gainNode.gain.value = 0;
+                    }
+                }
+                if (receivedGain) {
+                    receivedGain.gain.value = value * State.get('qsbFactor');
+                }
+                UI.updateVolumeDisplay();
+            }
+        },
+        tone: {
+            min: 400,
+            max: 1200,
+            getValue: (rotation) => 400 + (((rotation % 360) + 360) % 360 / 360) * 800,
+            setValue: (value) => {
+                State.set('toneFrequency', Math.round(value));
+                const oscillator = State.get('oscillator');
+                const audioContext = State.get('audioContext');
+                if (oscillator && audioContext) {
+                    oscillator.frequency.linearRampToValueAtTime(State.get('toneFrequency'), audioContext.currentTime + 0.01);
+                }
+                Audio.updateQrmTone();
+                UI.updateToneDisplay();
+            }
+        }
+    };
+
+    function updateKnob(type, e, isTouch = false) {
+        const knob = DOM.get(type === 'frequency' ? 'frequencyKnob' : type === 'volume' ? 'volumeKnob' : 'toneKnob');
+        if (!knob) return;
+        const rect = knob.getBoundingClientRect();
+        const centerX = rect.width / 2;
+        const centerY = rect.height / 2;
+        const clientX = isTouch ? e.touches[0].clientX : e.clientX;
+        const clientY = isTouch ? e.touches[0].clientY : e.clientY;
+        const mouseX = clientX - rect.left - centerX;
+        const mouseY = clientY - rect.top - centerY;
+        let currentAngle = Math.atan2(mouseY, mouseX) * (180 / Math.PI);
+        currentAngle = (currentAngle + 360) % 360;
+        currentAngle = (currentAngle + 90) % 360;
+        let angleDiff = currentAngle - State.get('startAngle');
+        if (angleDiff > 180) angleDiff -= 360;
+        if (angleDiff < -180) angleDiff += 360;
+        let rotation = State.get(type + 'KnobRotation') + angleDiff * Constants.KNOB_DAMPING;
+        State.set(type + 'KnobRotation', rotation);
+        UI.setKnobRotation(type === 'frequency' ? 'frequencyKnob' : type === 'volume' ? 'volumeKnob' : 'toneKnob', rotation);
+        const handler = handlers[type];
+        const newValue = handler.getValue(rotation);
+        const now = Date.now();
+        const lastUpdate = State.get('last' + type.charAt(0).toUpperCase() + type.slice(1) + 'Update') || 0;
+        if (handler.throttle && (now - lastUpdate > handler.throttle || Math.abs(newValue - State.get(type)) > (handler.tolerance || 0))) {
+            handler.setValue(newValue);
+            State.set('last' + type.charAt(0).toUpperCase() + type.slice(1) + 'Update', now);
+        } else {
+            handler.setValue(newValue);
+        }
+        State.set('startAngle', currentAngle);
+    }
+
+    return { updateKnob };
+})();
+
+const Audio = (() => {
+    let contextResumed = false;
+
+    async function ensureContext() {
+        if (!State.get('audioContext')) {
+            if (!init()) return false;
+        }
+        const audioContext = State.get('audioContext');
+        if (audioContext.state === 'suspended') {
+            try {
+                await audioContext.resume();
+                contextResumed = true;
+            } catch (e) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    async function userGestureResume() {
+        if (!contextResumed) {
+            await ensureContext();
+        }
+    }
+
+    function init() {
+        if (State.get('audioContext')) return true;
+        try {
+            const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const masterGain = audioContext.createGain();
+            masterGain.gain.value = 1;
+            masterGain.connect(audioContext.destination);
+
+            const gainNode = audioContext.createGain();
+            gainNode.gain.value = State.get('volume');
+            gainNode.connect(masterGain);
+
+            const receivedGain = audioContext.createGain();
+            receivedGain.gain.value = State.get('volume');
+            receivedGain.connect(masterGain);
+
+            State.update({
+                audioContext, masterGain, gainNode, receivedGain, oscillator: null
+            });
+
+            initNoise();
+            return true;
+        } catch (error) { return false; }
+    }
+
+    function updateQrmTone() {
+        const audioContext = State.get('audioContext');
+        if (!audioContext || !State.get('isQrmActive') || !State.get('qrmOscillator') || State.get('qrmRFfreq') === null) return;
+        const diff = State.get('qrmRFfreq') - State.get('currentFrequency');
+        const beat = diff * 1000000;
+        const qrmOsc = State.get('qrmOscillator');
+        qrmOsc.frequency.setValueAtTime(State.get('toneFrequency') + beat, audioContext.currentTime);
+    }
+
+    async function startTransmitting() {
+        await userGestureResume();
+        const state = State.getAll();
+        if (state.isTransmitting || state.isMuted || state.isSearching || state.isLongPressBlocked) return false;
+        if (!await ensureContext()) return false;
+
+        State.set('transmitStartTime', Date.now());
+        const { audioContext, gainNode, toneFrequency } = State.getAll();
+        
+        let txOsc = State.get('oscillator');
+        if (!txOsc) {
+            txOsc = audioContext.createOscillator();
+            txOsc.type = 'sine';
+            txOsc.frequency.setValueAtTime(toneFrequency || 800, audioContext.currentTime);
+            txOsc.connect(gainNode);
+            txOsc.start();
+            State.set('oscillator', txOsc);
+        }
+
+        const attackTime = 0.01;
+        gainNode.gain.cancelScheduledValues(audioContext.currentTime);
+        gainNode.gain.setValueAtTime(0, audioContext.currentTime);
+        gainNode.gain.linearRampToValueAtTime(State.get('volume'), audioContext.currentTime + attackTime);
+        
+        State.update({ isTransmitting: true });
+        DOM.toggleClass('morseKey', 'key-press', true);
+        
+        const waterfall = State.get('waterfallChart');
+        if (waterfall) waterfall.startSignal(State.get('currentFrequency'), true, false);
+
+        Network.sendSignal(true);
+
+        if (!State.get('transmitInterval')) {
+            const interval = setInterval(() => {
+                const wf = State.get('waterfallChart');
+                if (State.get('isTransmitting') && wf) {
+                    wf.drawContinuousSignal(State.get('currentFrequency'), true, false);
+                }
+            }, Constants.SCROLL_DELAY);
+            State.set('transmitInterval', interval);
+            State.addTimer(interval);
+        }
+
+        const maxDurationTimer = setTimeout(() => {
+            if (State.get('isTransmitting')) {
+                stopTransmitting(true);
+                State.set('isLongPressBlocked', true);
+            }
+        }, Constants.SIGNAL_TIMEOUT);
+        State.set('maxDurationTimer', maxDurationTimer);
+        State.addTimer(maxDurationTimer);
+        return true;
+    }
+
+    function stopTransmitting(isTimeout = false) {
+        const interval = State.get('transmitInterval');
+        if (interval) { 
+            clearInterval(interval); 
+            State.set('transmitInterval', null); 
+            if (State.get('timers')) State.get('timers').delete(interval); 
+        }
+
+        const { gainNode, audioContext, oscillator: txOsc } = State.getAll();
+        if (txOsc) {
+            try { 
+                txOsc.stop(audioContext.currentTime + 0.01); 
+                txOsc.disconnect(); 
+            } catch (e) {}
+            State.set('oscillator', null);
+        }
+        if (gainNode && audioContext) {
+            gainNode.gain.cancelScheduledValues(audioContext.currentTime);
+            gainNode.gain.linearRampToValueAtTime(0, audioContext.currentTime + 0.01);
+        }
+
+        DOM.toggleClass('morseKey', 'key-press', false);
+        const waterfall = State.get('waterfallChart');
+        const start = State.get('transmitStartTime');
+        if (waterfall && start) waterfall.endSignal(State.get('currentFrequency'), true, false, Date.now() - start);
+
+        Network.sendSignal(false);
+        State.set('transmitStartTime', null);
+        
+        const maxTimer = State.get('maxDurationTimer');
+        if (maxTimer) { 
+            clearTimeout(maxTimer); 
+            State.set('maxDurationTimer', null); 
+            if (State.get('timers')) State.get('timers').delete(maxTimer);
+        }
+        
+        if (isTimeout) showReminder(); else State.set('isLongPressBlocked', false);
+        State.set('isTransmitting', false);
+    }
+
+    async function playReceivedTone(signalId) {
+        if (!await ensureContext()) return;
+        const { audioContext, receivedGain, toneFrequency } = State.getAll();
+        const signals = State.get('activeRemoteSignals');
+
+        if (signals.has(signalId)) {
+            const old = signals.get(signalId);
+            if (old.oscillator) {
+                try { old.oscillator.stop(); old.oscillator.disconnect(); } catch(e) {}
+            }
+            if (old.safetyTimer) clearTimeout(old.safetyTimer);
+        }
+
+        const signal = signals.get(signalId) || { clientId: signalId };
+        let toneOffset = 0;
+        if (signal.clientId) {
+            toneOffset = SignalProcessor.getToneOffsetForClient(signal.clientId);
+        } else if (typeof signal.frequency === 'number') {
+            toneOffset = Math.round((signal.frequency % 0.1) * 1000);
+        }
+
+        const oscillator = audioContext.createOscillator();
+        const gain = audioContext.createGain();
+        oscillator.type = 'sine';
+        oscillator.frequency.setValueAtTime((toneFrequency || 800) + (toneOffset || 0), audioContext.currentTime);
+
+        gain.gain.setValueAtTime(0, audioContext.currentTime);
+        gain.gain.linearRampToValueAtTime(0.7 * State.get('volume'), audioContext.currentTime + 0.01);
+
+        oscillator.connect(gain);
+        gain.connect(receivedGain);
+        oscillator.start();
+
+        signal.oscillator = oscillator;
+        signal.gainNode = gain;
+
+        signal.safetyTimer = setTimeout(() => stopReceivedTone(signalId), 2000);
+        
+        signals.set(signalId, signal);
+        State.set('activeRemoteSignals', signals);
+    }
+
+    function stopReceivedTone(signalId) {
+        const signals = State.get('activeRemoteSignals');
+        const signal = signals.get(signalId);
+        if (!signal) return;
+
+        if (signal.safetyTimer) clearTimeout(signal.safetyTimer);
+        const { oscillator, gainNode } = signal;
+        if (oscillator && gainNode) {
+            const audioContext = State.get('audioContext');
+            const release = 0.01;
+            try {
+                gainNode.gain.cancelScheduledValues(audioContext.currentTime);
+                gainNode.gain.linearRampToValueAtTime(0, audioContext.currentTime + release);
+                oscillator.stop(audioContext.currentTime + release);
+                setTimeout(() => { 
+                    try { oscillator.disconnect(); gainNode.disconnect(); } catch(e) {} 
+                }, 50);
+            } catch (e) {}
+        }
+        signals.delete(signalId);
+        State.set('activeRemoteSignals', signals);
+    }
+
+    async function playTimeBroadcastTone(type) {
+        if (!await ensureContext()) return;
+        const { audioContext, toneFrequency, receivedGain } = State.getAll();
+        const oscillator = audioContext.createOscillator();
+        oscillator.type = 'sine';
+        oscillator.frequency.setValueAtTime(toneFrequency + 200, audioContext.currentTime);
+        const gain = audioContext.createGain();
+        const attackTime = 0.01;
+        const releaseTime = 0.01;
+        const duration = (type === 'dot' ? Constants.DOT_DURATION : Constants.DASH_DURATION) / 1000;
+        gain.gain.setValueAtTime(0, audioContext.currentTime);
+        gain.gain.linearRampToValueAtTime(0.8, audioContext.currentTime + attackTime);
+        gain.gain.setValueAtTime(0.8, audioContext.currentTime + attackTime);
+        gain.gain.linearRampToValueAtTime(0, audioContext.currentTime + duration - releaseTime);
+        gain.connect(receivedGain);
+        oscillator.connect(gain);
+        oscillator.start();
+        oscillator.stop(audioContext.currentTime + duration);
+    }
+
+    async function playTestTone() {
+        if (!await ensureContext()) return false;
+        const { audioContext, masterGain } = State.getAll();
+        const oscillator = audioContext.createOscillator();
+        const gain = audioContext.createGain();
+        oscillator.type = 'sine';
+        oscillator.frequency.setValueAtTime(1000, audioContext.currentTime);
+        const attackTime = 0.01;
+        const releaseTime = 0.01;
+        const duration = 0.5;
+        gain.gain.setValueAtTime(0, audioContext.currentTime);
+        gain.gain.linearRampToValueAtTime(0.3, audioContext.currentTime + attackTime);
+        gain.gain.setValueAtTime(0.3, audioContext.currentTime + attackTime);
+        gain.gain.linearRampToValueAtTime(0, audioContext.currentTime + duration - releaseTime);
+        oscillator.connect(gain);
+        gain.connect(masterGain);
+        oscillator.start();
+        oscillator.stop(audioContext.currentTime + duration);
+        return true;
+    }
+
+    function toggleMute() {
+        const isMuted = !State.get('isMuted');
+        State.set('isMuted', isMuted);
+        const masterGain = State.get('masterGain');
+        if (masterGain) masterGain.gain.value = isMuted ? 0 : 1;
+        
+        const qrmGain = State.get('qrmGain');
+        if (qrmGain) {
+            qrmGain.gain.value = isMuted ? 0 : (State.get('isQrmActive') ? Constants.NOISE.QRM_LEVEL * State.get('volume') : 0);
+        }
+
+        const btn = DOM.get('muteButton');
+        if (btn) {
+            btn.innerHTML = isMuted ? 
+                '<i class="fa fa-volume-off mr-1"></i>静音' : 
+                '<i class="fa fa-volume-up mr-1"></i>静音';
+        }
+        if (isMuted) stopTransmitting();
+    }
+
+    function initNoise() {
+        const audioContext = State.get('audioContext');
+        if (!audioContext) return;
+        const receivedGain = State.get('receivedGain');
+        const bufferSize = 4096 * 2;
+        const noiseBuffer = audioContext.createBuffer(1, bufferSize, audioContext.sampleRate);
+        const output = noiseBuffer.getChannelData(0);
+        for (let i = 0; i < bufferSize; i++) output[i] = Math.random() * 2 - 1;
+        const noiseSource = audioContext.createBufferSource();
+        noiseSource.buffer = noiseBuffer;
+        noiseSource.loop = true;
+        const noiseGain = audioContext.createGain();
+        noiseGain.gain.value = Constants.NOISE.QRN_LEVEL;
+        noiseSource.connect(noiseGain);
+        noiseGain.connect(receivedGain);
+        noiseSource.start();
+        State.update({ noiseGenerator: noiseSource, noiseGain });
+
+        const qrmOscillator = audioContext.createOscillator();
+        qrmOscillator.type = 'sine';
+        qrmOscillator.frequency.value = 800;
+        const qrmGain = audioContext.createGain();
+        qrmGain.gain.value = 0;
+        qrmOscillator.connect(qrmGain);
+        qrmGain.connect(receivedGain);
+        qrmOscillator.start();
+        State.update({ qrmOscillator, qrmGain });
+
+        startQSB();
+        scheduleQRM();
+    }
+
+    function startQSB() {
+        if (State.get('qsbInterval')) clearInterval(State.get('qsbInterval'));
+        const interval = setInterval(() => {
+            const audioContext = State.get('audioContext');
+            const receivedGain = State.get('receivedGain');
+            if (!audioContext || !receivedGain) return;
+            const time = audioContext.currentTime;
+            const qsbFactor = 1 - Constants.NOISE.QSB_DEPTH * (1 - Math.sin(time * Constants.NOISE.QSB_FREQUENCY)) / 2;
+            receivedGain.gain.value = State.get('volume') * qsbFactor;
+            State.set('qsbFactor', qsbFactor);
+        }, 50);
+        State.set('qsbInterval', interval);
+        State.addTimer(interval);
+    }
+
+    function scheduleQRM() {
+        if (State.get('qrmInterval')) clearTimeout(State.get('qrmInterval'));
+        const next = Math.random() * (Constants.NOISE.QRM_INTERVAL_MAX - Constants.NOISE.QRM_INTERVAL_MIN) + Constants.NOISE.QRM_INTERVAL_MIN;
+        const timer = setTimeout(() => {
+            if (State.get('isMuted')) {
+                scheduleQRM();
+                return;
+            }
+            startQRM();
+            const duration = Math.random() * (Constants.NOISE.QRM_DURATION_MAX - Constants.NOISE.QRM_DURATION_MIN) + Constants.NOISE.QRM_DURATION_MIN;
+            const durationTimer = setTimeout(() => {
+                stopQRM();
+                scheduleQRM();
+                if (State.get('timers')) State.get('timers').delete(durationTimer);
+            }, duration);
+            State.addTimer(durationTimer);
+        }, next);
+        State.set('qrmInterval', timer);
+        State.addTimer(timer);
+    }
+
+    function startQRM() {
+        if (State.get('isQrmActive') || !State.get('qrmGain')) return;
+        const band = Constants.BANDS[State.get('currentBandIndex')];
+        const qrmFreq = band.min + Math.random() * (band.max - band.min);
+        State.set('qrmRFfreq', qrmFreq);
+        const qrmGain = State.get('qrmGain');
+        if (qrmGain) qrmGain.gain.value = Constants.NOISE.QRM_LEVEL;
+        State.set('isQrmActive', true);
+        updateQrmTone();
+    }
+
+    function stopQRM() {
+        if (!State.get('isQrmActive')) return;
+        const qrmGain = State.get('qrmGain');
+        if (qrmGain) qrmGain.gain.value = 0;
+        State.set('isQrmActive', false);
+        State.set('qrmRFfreq', null);
+    }
+
+    function showReminder() {
+        let reminder = document.getElementById('reminder');
+        if (!reminder) {
+            reminder = document.createElement('div');
+            reminder.id = 'reminder';
+            Object.assign(reminder.style, {
+                position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
+                backgroundColor: 'rgba(255, 0, 0, 0.7)', color: 'white', padding: '10px',
+                borderRadius: '5px', zIndex: '1000', fontSize: '14px', pointerEvents: 'none'
+            });
+            const container = document.querySelector('.waterfall-container') || document.body;
+            container.appendChild(reminder);
+        }
+        reminder.textContent = '请勿持续按压超过1秒';
+        reminder.style.display = 'block';
+        const timer = setTimeout(() => { 
+            reminder.style.display = 'none'; 
+            if (State.get('timers')) State.get('timers').delete(timer);
+        }, 3000);
+        State.addTimer(timer);
+    }
+
+    function cleanup() {
+        State.clearTimers();
+        stopQRM();
+        const signals = State.get('activeRemoteSignals');
+        if (signals) {
+            signals.forEach((s, id) => stopReceivedTone(id));
+            signals.clear();
+        }
+    }
+
+    return {
+        init, startTransmitting, stopTransmitting, playReceivedTone, stopReceivedTone,
+        playTimeBroadcastTone, playTestTone, toggleMute, userGestureResume, updateQrmTone,
+        startQSB, startQRM, stopQRM, ensureContext, cleanup
+    };
+})();
+
+const Network = (() => {
+    function initTxConnection(bandIndex) {
+        const txWs = State.get('txWs');
+        if (txWs) {
+            txWs.onclose = null;
+            txWs.close(1000, '重新连接');
+        }
+        const bandCode = Constants.BANDS[bandIndex].code;
+        const newTxWs = new WebSocket(`${Constants.SERVER_BASE_URL}/tx${bandCode}`);
+        
+        newTxWs.onopen = () => State.set('lastActivityTime', Date.now());
+        newTxWs.onclose = (event) => {
+            if (event.code !== 1000) {
+                const attempts = State.get('reconnectAttempts') || 0;
+                if (attempts < 5) {
+                    const timer = setTimeout(() => {
+                        State.set('reconnectAttempts', attempts + 1);
+                        initTxConnection(bandIndex);
+                    }, 2000);
+                    State.addTimer(timer);
+                }
+            }
+        };
+        newTxWs.onerror = () => console.error("TX Socket Error");
+        State.set('txWs', newTxWs);
+    }
+
+    function connectToBand(bandIndex) {
+        Audio.cleanup();
+
+        const ws = State.get('ws');
+        if (ws) { ws.onclose = null; ws.close(1000, '切换波段'); }
+        const txWs = State.get('txWs');
+        if (txWs) { txWs.onclose = null; txWs.close(1000, '切换波段'); }
+
+        State.set('currentBandIndex', bandIndex);
+        const band = Constants.BANDS[bandIndex];
+        let freq = parseFloat(((band.min + band.max) / 2).toFixed(3));
+        State.set('currentFrequency', freq);
+
+        Audio.updateQrmTone();
+        UI.resetFrequencyKnobRotation();
+        UI.updateFrequencyDisplay();
+        UI.updateFrequencyIndicatorPosition();
+        UI.createFrequencyScale();
+        UI.createWaterfallMarkers();
+        UI.resetWaterfallPosition();
+        
+        const bandSelect = DOM.get('bandSelect');
+        if (bandSelect) bandSelect.value = bandIndex;
+        UI.updateConnectionStatus('<i class="fa fa-circle fa-spin"></i> 连接中...', 'status-connecting');
+
+        setTimeout(() => {
+            const bandCode = band.code;
+            const newWs = new WebSocket(`${Constants.SERVER_BASE_URL}/rx${bandCode}`);
+            
+            newWs.onopen = () => {
+                UI.updateConnectionStatus(`<i class="fa fa-circle"></i> 已连接到 ${band.name}`, 'status-connected');
+                initTxConnection(bandIndex);
+                State.set('lastActivityTime', Date.now());
+            };
+
+            newWs.onmessage = (event) => {
+                State.set('lastActivityTime', Date.now());
+                try {
+                    const signal = JSON.parse(event.data);
+                    SignalProcessor.handleIncomingSignal(signal);
+                } catch (e) {}
+            };
+
+            newWs.onclose = (event) => {
+                UI.updateConnectionStatus(`<i class="fa fa-circle"></i> 连接断开`, 'status-disconnected');
+                if (event.code !== 1000) {
+                    setTimeout(() => connectToBand(State.get('currentBandIndex')), 3000);
+                }
+            };
+
+            newWs.onerror = () => UI.updateConnectionStatus('连接错误');
+            State.set('ws', newWs);
+        }, 200);
+    }
+
+    function sendSignal(isStart) {
+        const txWs = State.get('txWs');
+        if (!txWs || txWs.readyState !== WebSocket.OPEN) return;
+        const signalData = {
+            frequency: State.get('currentFrequency'),
+            clientId: State.get('clientId'),
+            type: isStart ? 'start' : 'end',
+            timestamp: Date.now()
+        };
+        if (!isStart) {
+            const start = State.get('transmitStartTime') || Date.now();
+            signalData.duration = Date.now() - start;
+        }
+        try { txWs.send(JSON.stringify(signalData)); } catch (e) {}
+    }
+
+    function cleanupConnections() {
+        const ws = State.get('ws');
+        if (ws) { ws.onclose = null; ws.close(1000); }
+        const txWs = State.get('txWs');
+        if (txWs) { txWs.onclose = null; txWs.close(1000); }
+        Audio.cleanup();
+    }
+
+    return { connectToBand, sendSignal, cleanupConnections };
+})();
+
+const SignalProcessor = (() => {
+    function getToneOffsetForClient(clientId) {
+        let hash = 0;
+        for (let i = 0; i < clientId.length; i++) {
+            const char = clientId.charCodeAt(i);
+            hash = ((hash << 5) - hash) + char;
+            hash = hash & hash;
+        }
+        const range = Constants.SIGNAL_PROCESSING.CLIENT_TONE_VARIATION * 2;
+        const offset = ((hash % range) + range) % range;
+        return offset - Constants.SIGNAL_PROCESSING.CLIENT_TONE_VARIATION;
+    }
+    function findSimilarSignalId(frequency) {
+        const tolerance = Constants.SIGNAL_PROCESSING.SIGNAL_MERGE_THRESHOLD;
+        const now = Date.now();
+        const signals = State.get('activeRemoteSignals');
+        for (const [id, signal] of signals.entries()) {
+            if (Math.abs(signal.frequency - frequency) < tolerance &&
+               !signal.isTimeSignal &&
+               (now - signal.startTime) < (Constants.SIGNAL_TIMEOUT + Constants.SIGNAL_PROCESSING.SIGNAL_GAP_THRESHOLD)) {
+                return id;
+            }
+        }
+        return null;
+    }
+    function forceEndRemoteSignal(signalId) {
+        const signals = State.get('activeRemoteSignals');
+        const signal = signals.get(signalId);
+        if (!signal) return;
+        const waterfall = State.get('waterfallChart');
+        const duration = Date.now() - signal.startTime;
+        if (waterfall) {
+            waterfall.endSignal(signal.frequency, false, signal.isTimeSignal, duration, true);
+        }
+        Audio.stopReceivedTone(signalId);
+        if (signal.renderInterval) {
+            clearInterval(signal.renderInterval);
+            State.get('timers').delete(signal.renderInterval);
+        }
+        if (signal.timeout) {
+            clearTimeout(signal.timeout);
+            State.get('timers').delete(signal.timeout);
+        }
+        signals.delete(signalId);
+        State.set('activeRemoteSignals', signals);
+    }
+    function handleIncomingSignal(signal) {
+        if (typeof signal !== 'object' || typeof signal.frequency !== 'number' || !signal.type) return;
+        if (State.get('justConnected') && signal.type === 'start') return;
+        const signalBand = Constants.BANDS.find(band =>
+            signal.frequency >= band.min && signal.frequency <= band.max
+        );
+        const bandName = signalBand ? signalBand.name : Constants.BANDS[State.get('currentBandIndex')].name;
+        const isLocal = signal.clientId === State.get('clientId');
+        const isTimeBroadcastMarker = signal.type === 'marker';
+        const isTimeBroadcastSignal = signal.type === 'dot' || signal.type === 'dash';
+        const isTimeBroadcastGap = signal.type === 'gap';
+        if (isLocal && (signal.type === 'start' || signal.type === 'end')) return;
+        State.set('lastSignalTime', Date.now());
+        if (bandName === Constants.TIME_BROADCAST_BAND &&
+            Math.abs(signal.frequency - Constants.TIME_BROADCAST_FREQUENCY) < Constants.SIGNAL_PROCESSING.FREQUENCY_TOLERANCE) {
+            DOM.toggleClass('timeBroadcastIndicator', 'hidden', false);
+            const timeout = setTimeout(() => {
+                if (!State.get('isReceivingTimeBroadcast')) {
+                    DOM.toggleClass('timeBroadcastIndicator', 'hidden', true);
+                }
+                State.get('timers').delete(timeout);
+            }, 10000);
+            State.set('timeBroadcastTimeout', timeout);
+            State.addTimer(timeout);
+            if (isTimeBroadcastMarker) {
+                State.update({
+                    isReceivingTimeBroadcast: true,
+                    timeBroadcastBuffer: [],
+                    lastSignalTimestamp: signal.timestamp
+                });
+                const timeBroadcast = State.get('timeBroadcast');
+                timeBroadcast.decodingAttempts = 0;
+                State.set('timeBroadcast', timeBroadcast);
+                const waterfall = State.get('waterfallChart');
+                if (waterfall) {
+                    const signalId = `time-broadcast-${Date.now()}`;
+                    waterfall.startSignal(Constants.TIME_BROADCAST_FREQUENCY, false, true, signalId);
+                    const signals = State.get('activeRemoteSignals');
+                    signals.set(signalId, {
+                        frequency: Constants.TIME_BROADCAST_FREQUENCY,
+                        startTime: Date.now(),
+                        isTimeSignal: true,
+                        oscillator: null,
+                        toneOffset: 200,
+                        elementCount: 0,
+                        waitingForFirstElement: true
+                    });
+                    State.set('activeRemoteSignals', signals);
+                }
+                return;
+            } else if (isTimeBroadcastSignal) {
+                const interval = signal.timestamp - State.get('lastSignalTimestamp');
+                const buffer = State.get('timeBroadcastBuffer');
+                buffer.push({ type: signal.type, interval, timestamp: signal.timestamp });
+                State.set('timeBroadcastBuffer', buffer);
+                State.set('lastSignalTimestamp', signal.timestamp);
+                if (!State.get('isMuted') &&
+                    Math.abs(signal.frequency - Constants.TIME_BROADCAST_FREQUENCY) < Constants.SIGNAL_PROCESSING.TIME_SIGNAL_TOLERANCE &&
+                    Math.abs(State.get('currentFrequency') - Constants.TIME_BROADCAST_FREQUENCY) < Constants.SIGNAL_PROCESSING.TIME_SIGNAL_TOLERANCE) {
+                    Audio.playTimeBroadcastTone(signal.type);
+                }
+                const duration = signal.duration || (signal.type === 'dot' ? Constants.DOT_DURATION : Constants.DASH_DURATION);
+                State.set('isDrawingTimeSignal', true);
+                const timeout = setTimeout(() => {
+                    State.set('isDrawingTimeSignal', false);
+                    State.get('timers').delete(timeout);
+                }, duration);
+                State.set('timeSignalDrawTimeout', timeout);
+                State.addTimer(timeout);
+            } else if (isTimeBroadcastGap) {
+                const timeoutDelay = isTimeBroadcastMarker ? 1000 :
+                                    (isTimeBroadcastSignal ? 500 :
+                                    (State.get('timeBroadcastBuffer').length > 3 ? 3000 : 2000));
+                const timeout = setTimeout(() => {
+                    attemptDecodeWithRetry(0);
+                    State.set('isReceivingTimeBroadcast', false);
+                    const waterfall = State.get('waterfallChart');
+                    if (waterfall) {
+                        const signals = State.get('activeRemoteSignals');
+                        const timeSignalId = Array.from(signals.keys()).find(id => id.startsWith('time-broadcast-'));
+                        if (timeSignalId) {
+                            const signal = signals.get(timeSignalId);
+                            const duration = Date.now() - signal.startTime;
+                            waterfall.endSignal(Constants.TIME_BROADCAST_FREQUENCY, false, true, duration, false);
+                            const removeDelay = Math.max(5000, signal.elementCount * 800);
+                            const removeTimer = setTimeout(() => {
+                                const sigs = State.get('activeRemoteSignals');
+                                sigs.delete(timeSignalId);
+                                State.set('activeRemoteSignals', sigs);
+                                State.get('timers').delete(removeTimer);
+                            }, removeDelay);
+                            State.addTimer(removeTimer);
+                        }
+                    }
+                    State.get('timers').delete(timeout);
+                }, timeoutDelay);
+                State.set('timeBroadcastDecodeTimeout', timeout);
+                State.addTimer(timeout);
+            }
+        } else if (!isTimeBroadcastGap) {
+            const freqKey = signal.frequency.toFixed(3);
+            const history = State.get('signalHistory');
+            if (!history[bandName]) history[bandName] = {};
+            if (!history[bandName][freqKey]) {
+                history[bandName][freqKey] = { timestamp: Date.now(), count: 1 };
+            } else {
+                history[bandName][freqKey].timestamp = Date.now();
+                history[bandName][freqKey].count = Math.min(history[bandName][freqKey].count + 1, 100);
+            }
+            State.set('signalHistory', history);
+            const waterfall = State.get('waterfallChart');
+            if (waterfall) {
+                const isTimeSignal = bandName === Constants.TIME_BROADCAST_BAND &&
+                                   Math.abs(signal.frequency - Constants.TIME_BROADCAST_FREQUENCY) < Constants.SIGNAL_PROCESSING.FREQUENCY_TOLERANCE;
+                let duration;
+                if (signal.endTimestamp && signal.startTimestamp) {
+                    duration = signal.endTimestamp - signal.startTimestamp;
+                } else {
+                    duration = signal.type === 'start' ? 100 : 0;
+                }
+                if (signal.type === 'start') {
+                    let signalId = findSimilarSignalId(signal.frequency);
+                    const now = Date.now();
+                    if (signalId) {
+                        const signals = State.get('activeRemoteSignals');
+                        const existing = signals.get(signalId);
+                        const timeSinceLast = now - existing.lastUpdateTime;
+                        if (timeSinceLast > Constants.SIGNAL_PROCESSING.SIGNAL_CONTINUITY_THRESHOLD) {
+                            waterfall.markSignalGap(existing.frequency, existing.isLocal, existing.isTimeSignal,
+                                                  Math.round(timeSinceLast / Constants.SCROLL_DELAY));
+                            Audio.stopReceivedTone(signalId);
+                            if (existing.renderInterval) {
+                                clearInterval(existing.renderInterval);
+                                State.get('timers').delete(existing.renderInterval);
+                            }
+                            if (existing.timeout) {
+                                clearTimeout(existing.timeout);
+                                State.get('timers').delete(existing.timeout);
+                            }
+                            signalId = null;
+                        } else {
+                            existing.lastUpdateTime = signal.timestamp;
+                            signals.set(signalId, existing);
+                            State.set('activeRemoteSignals', signals);
+                            if (!State.get('isMuted')) Audio.playReceivedTone(signalId);
+                            return;
+                        }
+                    }
+                    if (!signalId) {
+                        signalId = `${signal.frequency.toFixed(3)}-${signal.timestamp}`;
+                        const toneOffset = signal.clientId ? getToneOffsetForClient(signal.clientId) : 0;
+                        const isDotSignal = signal.duration && signal.duration < 200;
+                        const signals = State.get('activeRemoteSignals');
+                        signals.set(signalId, {
+                            frequency: signal.frequency,
+                            startTime: signal.timestamp,
+                            lastUpdateTime: signal.timestamp,
+                            isTimeSignal,
+                            oscillator: null,
+                            toneOffset,
+                            isLocal,
+                            isDot: isDotSignal,
+                            timeout: null,
+                            renderInterval: null
+                        });
+                        State.set('activeRemoteSignals', signals);
+                        waterfall.startSignal(signal.frequency, isLocal, isTimeSignal, signalId);
+                    } else {
+                        const signals = State.get('activeRemoteSignals');
+                        const existing = signals.get(signalId);
+                        existing.lastUpdateTime = signal.timestamp;
+                        signals.set(signalId, existing);
+                        State.set('activeRemoteSignals', signals);
+                    }
+                    const band = Constants.BANDS[State.get('currentBandIndex')];
+                    const bandWidth = band.max - band.min;
+                    const tolerance = bandWidth * 0.01;
+                    if (!State.get('isMuted') && Math.abs(signal.frequency - State.get('currentFrequency')) < tolerance) {
+                        const signals = State.get('activeRemoteSignals');
+                        if (!signals.get(signalId)?.oscillator) {
+                            Audio.playReceivedTone(signalId);
+                        }
+                    }
+                    const signals = State.get('activeRemoteSignals');
+                    const existing = signals.get(signalId);
+                    if (!existing.renderInterval) {
+                        const intervalId = setInterval(() => {
+                            const sigs = State.get('activeRemoteSignals');
+                            if (!sigs.has(signalId)) {
+                                clearInterval(intervalId);
+                                State.get('timers').delete(intervalId);
+                                return;
+                            }
+                            const sig = sigs.get(signalId);
+                            waterfall.drawContinuousSignal(
+                                sig.frequency,
+                                sig.isLocal,
+                                sig.isTimeSignal
+                            );
+                        }, Constants.SCROLL_DELAY / 2);
+                        existing.renderInterval = intervalId;
+                        signals.set(signalId, existing);
+                        State.addTimer(intervalId);
+                    }
+                    const timeout = setTimeout(() => {
+                        forceEndRemoteSignal(signalId);
+                        State.get('timers').delete(timeout);
+                    }, Constants.SIGNAL_TIMEOUT);
+                    existing.timeout = timeout;
+                    signals.set(signalId, existing);
+                    State.set('activeRemoteSignals', signals);
+                } else if (signal.type === 'end') {
+                    const signalKey = findSimilarSignalId(signal.frequency) ||
+                                     `${signal.frequency.toFixed(3)}-${signal.startTimestamp}`;
+                    const signals = State.get('activeRemoteSignals');
+                    if (signals.has(signalKey)) {
+                        duration = signal.endTimestamp - signal.startTimestamp;
+                        const existing = signals.get(signalKey);
+                        if (existing.timeout) {
+                            clearTimeout(existing.timeout);
+                            State.get('timers').delete(existing.timeout);
+                        }
+                        if (existing.renderInterval) {
+                            clearInterval(existing.renderInterval);
+                            State.get('timers').delete(existing.renderInterval);
+                        }
+                        waterfall.endSignal(signal.frequency, isLocal, isTimeSignal, duration);
+                        Audio.stopReceivedTone(signalKey);
+                        signals.delete(signalKey);
+                        State.set('activeRemoteSignals', signals);
+                    }
+                }
+            }
+        }
+    }
+    function attemptDecodeWithRetry(attempt) {
+        if (attempt >= Constants.SIGNAL_PROCESSING.RETRY_DECODE_ATTEMPTS) {
+            finalizeTimeBroadcastDecode();
+            return;
+        }
+        const result = decodeTimeBroadcastWithConfidence();
+        if (result.confidence >= Constants.SIGNAL_PROCESSING.DECODE_CONFIDENCE_THRESHOLD) {
+            const timeBroadcast = State.get('timeBroadcast');
+            timeBroadcast.confidence = result.confidence;
+            timeBroadcast.lastValidTime = result.text;
+            State.set('timeBroadcast', timeBroadcast);
+            finalizeTimeBroadcastDecode();
+            return;
+        }
+        const timer = setTimeout(() => attemptDecodeWithRetry(attempt + 1), 300);
+        State.addTimer(timer);
+    }
+    function decodeTimeBroadcastWithConfidence() {
+        const buffer = State.get('timeBroadcastBuffer');
+        if (buffer.length === 0) return { text: '', confidence: 0 };
+        const morseElements = [];
+        let currentCode = '';
+        let unknownCount = 0;
+        buffer.forEach((item, index) => {
+            if (item.type === 'dot' || item.type === 'dash') {
+                currentCode += item.type === 'dot' ? '.' : '-';
+            }
+            const nextItem = buffer[index + 1];
+            if (nextItem) {
+                const normalizedInterval = nextItem.interval / Constants.DOT_DURATION;
+                if (normalizedInterval > 3) {
+                    if (currentCode) {
+                        morseElements.push(currentCode);
+                        if (!MorseCodeMap[currentCode]) unknownCount++;
+                        currentCode = '';
+                    }
+                    if (normalizedInterval > 7) {
+                        morseElements.push('/');
+                    }
+                }
+            } else {
+                if (currentCode) {
+                    morseElements.push(currentCode);
+                    if (!MorseCodeMap[currentCode]) unknownCount++;
+                }
+            }
+        });
+        let decodedText = '';
+        morseElements.forEach(code => {
+            decodedText += MorseCodeMap[code] || '?';
+        });
+        const totalElements = morseElements.filter(code => code !== '/').length;
+        const confidence = totalElements > 0 ? 1 - (unknownCount / totalElements) : 0;
+        return { text: decodedText, confidence };
+    }
+    function finalizeTimeBroadcastDecode() {
+        const timeBroadcast = State.get('timeBroadcast');
+        const buffer = State.get('timeBroadcastBuffer');
+        if (!timeBroadcast.lastValidTime && buffer.length > 0) {
+            const rawMorse = buffer
+                .filter(item => item.type === 'dot' || item.type === 'dash')
+                .map(item => item.type === 'dot' ? '.' : '-')
+                .join(' ');
+            timeBroadcast.lastValidTime = `原始码: ${rawMorse}`;
+            timeBroadcast.confidence = 0;
+        }
+        const display = DOM.get('decodedTimeDisplay');
+        if (display && timeBroadcast.lastValidTime) {
+            let text = `时间广播: ${timeBroadcast.lastValidTime}`;
+            if (timeBroadcast.confidence > 0) {
+                text += ` (可信度: ${(timeBroadcast.confidence * 100).toFixed(0)}%)`;
+            }
+            display.textContent = text;
+            DOM.toggleClass('decodedTimeDisplay', 'hidden', false);
+            display.className = 'decoded-time';
+            if (timeBroadcast.confidence >= 0.7) {
+                display.classList.add('high-confidence');
+            } else if (timeBroadcast.confidence >= 0.3) {
+                display.classList.add('medium-confidence');
+            } else {
+                display.classList.add('low-confidence');
+            }
+            const timer = setTimeout(() => DOM.toggleClass('decodedTimeDisplay', 'hidden', true), 15000);
+            State.addTimer(timer);
+        }
+        timeBroadcast.lastSyncTime = Date.now();
+        State.set('timeBroadcast', timeBroadcast);
+    }
+    function cleanupAndCheckTimeouts() {
+        const now = Date.now();
+        const signals = State.get('activeRemoteSignals');
+        for (const [id, signal] of signals.entries()) {
+            if (now - signal.startTime > Constants.SIGNAL_TIMEOUT * 2) {
+                forceEndRemoteSignal(id);
+            }
+        }
+        const ws = State.get('ws');
+        if (ws && State.get('lastActivityTime') && now - State.get('lastActivityTime') > 3600000) { 
+            ws.close(1000, '长时间无活动');
+        }
+    }
+    return { handleIncomingSignal, cleanupAndCheckTimeouts, forceEndRemoteSignal, getToneOffsetForClient };
+})();
+
+const Waterfall = (() => {
+    let rafId = null;
+    let lastScrollTime = 0;
+    function init() {
+        const canvas = DOM.get('waterfallCanvas');
+        if (!canvas) return;
+        canvas.width = canvas.offsetWidth;
+        canvas.height = canvas.offsetHeight;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        const activeSignals = new Map();
+        let dirtyRegions = [];
+        const waterfall = {
+            ctx,
+            width: canvas.width,
+            height: canvas.height,
+            scrollOffset: 0,
+            activeSignals,
+            visibleRange: { start: 0, end: 1 },
+            dirtyRegions,
+            initBuffer: function() {
+                let buffer = [];
+                for (let y = 0; y < this.height; y++) {
+                    buffer[y] = new Uint8Array(this.width).fill(0);
+                }
+                State.set('signalBuffer', buffer);
+                activeSignals.clear();
+                this.dirtyRegions = [];
+            },
+            addDirtyRegion: function(x, y, width = 1, height = 1) {
+                this.dirtyRegions.push({x, y, width, height});
+            },
+            mergeDirtyRegions: function() {
+                if (this.dirtyRegions.length <= 1) return;
+                const merged = [this.dirtyRegions[0]];
+                for (let i = 1; i < this.dirtyRegions.length; i++) {
+                    const current = this.dirtyRegions[i];
+                    let mergedIndex = -1;
+                    for (let j = 0; j < merged.length; j++) {
+                        const m = merged[j];
+                        if (current.x < m.x + m.width &&
+                            current.x + current.width > m.x &&
+                            current.y < m.y + m.height &&
+                            current.y + current.height > m.y) {
+                            mergedIndex = j;
+                            break;
+                        }
+                    }
+                    if (mergedIndex !== -1) {
+                        const m = merged[mergedIndex];
+                        merged[mergedIndex] = {
+                            x: Math.min(m.x, current.x),
+                            y: Math.min(m.y, current.y),
+                            width: Math.max(m.x + m.width, current.x + current.width) - Math.min(m.x, current.x),
+                            height: Math.max(m.y + m.height, current.y + current.height) - Math.min(m.y, current.y)
+                        };
+                    } else {
+                        merged.push(current);
+                    }
+                }
+                this.dirtyRegions = merged;
+            },
+            startSignal: function(frequency, isLocal = false, isTimeSignal = false, signalId = null) {
+                const band = Constants.BANDS[State.get('currentBandIndex')];
+                const range = band.max - band.min;
+                const position = Math.round((frequency - band.min) / range * this.width);
+                if (position < 0 || position >= this.width) return;
+                const id = signalId || `${frequency.toFixed(3)}-${Date.now()}`;
+                activeSignals.set(id, {
+                    position,
+                    isLocal,
+                    isTimeSignal,
+                    startTime: Date.now(),
+                    spread: 2,
+                    lastDrawnRow: this.height - 1
+                });
+                const row = this.height - 1;
+                const buffer = State.get('signalBuffer');
+                if (buffer.length > row) {
+                    buffer[row][position] = isTimeSignal ? 4 : (isLocal ? 3 : 2);
+                    for (let j = 1; j <= 2; j++) {
+                        if (position - j >= 0) buffer[row][position - j] = isTimeSignal ? 4 : (isLocal ? 3 : 2);
+                        if (position + j < this.width) buffer[row][position + j] = isTimeSignal ? 4 : (isLocal ? 3 : 2);
+                    }
+                    State.set('signalBuffer', buffer);
+                    this.addDirtyRegion(Math.max(0, position - 2), row, 5, 1);
+                }
+            },
+            drawContinuousSignal: function(frequency, isLocal = false, isTimeSignal = false) {
+                const band = Constants.BANDS[State.get('currentBandIndex')];
+                const range = band.max - band.min;
+                const position = Math.round((frequency - band.min) / range * this.width);
+                if (position < 0 || position >= this.width) return;
+                const row = this.height - 1;
+                const buffer = State.get('signalBuffer');
+                if (buffer.length > row) {
+                    buffer[row][position] = isTimeSignal ? 4 : (isLocal ? 3 : 2);
+                    for (let j = 1; j <= 2; j++) {
+                        if (position - j >= 0) buffer[row][position - j] = isTimeSignal ? 4 : (isLocal ? 3 : 2);
+                        if (position + j < this.width) buffer[row][position + j] = isTimeSignal ? 4 : (isLocal ? 3 : 2);
+                    }
+                    State.set('signalBuffer', buffer);
+                    this.addDirtyRegion(Math.max(0, position - 2), row, 5, 1);
+                }
+            },
+            endSignal: function(frequency, isLocal = false, isTimeSignal = false, duration, isTimeout = false) {
+                const signalKey = `${frequency.toFixed(3)}-`;
+                for (const [key, signal] of activeSignals.entries()) {
+                    if (key.startsWith(signalKey)) {
+                        if (signal.renderInterval) {
+                            clearInterval(signal.renderInterval);
+                            State.get('timers').delete(signal.renderInterval);
+                        }
+                        if (!isTimeSignal) {
+                            activeSignals.delete(key);
+                        } else {
+                            const timer = setTimeout(() => activeSignals.delete(key), 8000);
+                            State.addTimer(timer);
+                        }
+                    }
+                }
+            },
+            markSignalGap: function(frequency, isLocal, isTimeSignal, gapRows) {
+                const band = Constants.BANDS[State.get('currentBandIndex')];
+                const range = band.max - band.min;
+                const position = Math.round((frequency - band.min) / range * this.width);
+                const buffer = State.get('signalBuffer');
+                for (let i = 0; i < gapRows; i++) {
+                    const row = this.height - 1 - i;
+                    if (row >= 0 && buffer.length > row) {
+                        buffer[row][position] = 1;
+                    }
+                }
+                State.set('signalBuffer', buffer);
+                this.addDirtyRegion(Math.max(0, position - 1), Math.max(0, this.height - gapRows), 3, gapRows);
+            },
+            scrollUp: function() {
+                let buffer = State.get('signalBuffer');
+                if (buffer.length === 0) return;
+                buffer.shift();
+                buffer.push(new Uint8Array(this.width).fill(0));
+                if (State.get('isDrawingTimeSignal')) {
+                    const band = Constants.BANDS[State.get('currentBandIndex')];
+                    const range = band.max - band.min;
+                    const position = Math.round((Constants.TIME_BROADCAST_FREQUENCY - band.min) / range * this.width);
+                    if (position >= 0 && position < this.width) {
+                        const row = this.height - 1;
+                        const strength = 4;
+                        buffer[row][position] = strength;
+                        for (let j = 1; j <= 2; j++) {
+                            if (position - j >= 0) buffer[row][position - j] = strength;
+                            if (position + j < this.width) buffer[row][position + j] = strength;
+                        }
+                        this.addDirtyRegion(Math.max(0, position - 2), row, 5, 1);
+                    }
+                }
+                State.set('signalBuffer', buffer);
+                this.dirtyRegions = [{x: 0, y: 0, width: this.width, height: this.height}];
+                for (const [id, signal] of activeSignals.entries()) {
+                    signal.lastDrawnRow = this.height - 1;
+                    activeSignals.set(id, signal);
+                }
+            },
+            update: function() {
+                if (!this.ctx) return;
+                if (this.dirtyRegions.length === 0) {
+                    rafId = requestAnimationFrame(() => this.update());
+                    return;
+                }
+                this.mergeDirtyRegions();
+                this.ctx.fillStyle = '#050a1a';
+                this.ctx.fillRect(0, 0, this.width, this.height);
+                this.ctx.strokeStyle = 'rgba(0, 255, 0, 0.1)';
+                this.ctx.lineWidth = 1;
+                for (let y = 0; y < this.height; y += 40) {
+                    this.ctx.beginPath();
+                    this.ctx.moveTo(0, y);
+                    this.ctx.lineTo(this.width, y);
+                    this.ctx.stroke();
+                }
+                for (let x = 0; x < this.width; x += 80) {
+                    this.ctx.beginPath();
+                    this.ctx.moveTo(x, 0);
+                    this.ctx.lineTo(x, this.height);
+                    this.ctx.stroke();
+                }
+                this.dirtyRegions.forEach(region => {
+                    this.ctx.save();
+                    this.ctx.beginPath();
+                    this.ctx.rect(region.x, region.y, region.width, region.height);
+                    this.ctx.clip();
+                    const buffer = State.get('signalBuffer');
+                    for (let y = region.y; y < region.y + region.height && y < this.height; y++) {
+                        if (!buffer[y]) continue;
+                        const age = (this.height - y) / this.height;
+                        for (let x = region.x; x < region.x + region.width && x < this.width; x++) {
+                            const strength = buffer[y][x];
+                            if (strength > 1) {
+                                let color, alpha;
+                                if (strength === 2) {
+                                    alpha = 1 - (age * 0.7);
+                                    color = `rgba(0, 255, 0, ${alpha})`;
+                                } else if (strength === 3) {
+                                    alpha = 1 - (age * 0.7);
+                                    color = `rgba(255, 215, 0, ${alpha})`;
+                                } else if (strength === 4) {
+                                    alpha = 1 - (age * 0.4);
+                                    color = `rgba(255, 165, 0, ${alpha})`;
+                                }
+                                this.ctx.fillStyle = color;
+                                this.ctx.fillRect(x, y, 1, 1);
+                            }
+                        }
+                    }
+                    this.ctx.restore();
+                });
+                this.dirtyRegions = [];
+                rafId = requestAnimationFrame(() => this.update());
+            }
+        };
+        waterfall.initBuffer();
+
+        function mainLoop(currentTime) {
+            if (currentTime - lastScrollTime >= Constants.SCROLL_DELAY) {
+                waterfall.scrollUp();
+                lastScrollTime = currentTime;
+            }
+            waterfall.update();
+            rafId = requestAnimationFrame(mainLoop);
+        }
+        rafId = requestAnimationFrame(mainLoop);
+
+        State.set('waterfallChart', waterfall);
+    }
+
+    function cleanup() {
+        if (rafId) {
+            cancelAnimationFrame(rafId);
+        }
+    }
+
+    return { init, cleanup };
+})();
+
+const UI = (() => {
+    function updateConnectionStatus(message, className = 'status-disconnected') {
+        const el = DOM.get('connectionStatus');
+        if (el) {
+            el.className = className;
+            el.innerHTML = message;
+        }
+    }
+    function populateBandSelect() {
+        const select = DOM.get('bandSelect');
+        if (!select) return;
+        select.innerHTML = '';
+        Constants.BANDS.forEach((band, index) => {
+            const option = document.createElement('option');
+            option.value = index;
+            const label = band.name === Constants.TIME_BROADCAST_BAND
+                ? `${band.name} (${band.min} - ${band.max} MHz) - 含时间与ISS坐标`
+                : `${band.name} (${band.min} - ${band.max} MHz)`;
+            option.textContent = label;
+            if (index === State.get('currentBandIndex')) option.selected = true;
+            select.appendChild(option);
+        });
+    }
+    function resetFrequencyKnobRotation() {
+        const band = Constants.BANDS[State.get('currentBandIndex')];
+        const range = band.max - band.min;
+        const percentage = (State.get('currentFrequency') - band.min) / range;
+        const rotation = percentage * 360;
+        State.set('frequencyKnobRotation', rotation);
+        setKnobRotation('frequencyKnob', rotation);
+    }
+    function createWaterfallMarkers() {
+        const container = document.querySelector('.waterfall-markers');
+        const canvas = DOM.get('waterfallCanvas');
+        if (!container || !canvas) return;
+        container.innerHTML = '';
+        container.style.paddingLeft = '10px';
+        container.style.paddingRight = '10px';
+        container.style.overflow = 'hidden';
+        container.style.width = `${canvas.offsetWidth}px`;
+        const band = Constants.BANDS[State.get('currentBandIndex')];
+        const range = band.max - band.min;
+        const step = range / 6;
+        for (let i = 0; i <= 6; i++) {
+            const freq = band.min + (step * i);
+            const marker = document.createElement('div');
+            marker.className = 'waterfall-marker';
+            marker.style.position = 'absolute';
+            marker.style.left = `${(i / 6) * 100}%`;
+            marker.style.top = '5px';
+            marker.style.color = 'rgba(0, 255, 0, 0.7)';
+            marker.style.fontSize = '12px';
+            marker.style.textShadow = '0 0 3px rgba(0, 255, 0, 0.8)';
+            marker.style.transform = 'translateX(-50%)';
+            marker.style.whiteSpace = 'nowrap';
+            marker.textContent = freq.toFixed(3) + ' MHz';
+            container.appendChild(marker);
+        }
+        if (band.name === Constants.TIME_BROADCAST_BAND) {
+            const marker = document.createElement('div');
+            marker.className = 'waterfall-marker time-broadcast';
+            marker.style.position = 'absolute';
+            const timeFreq = Constants.TIME_BROADCAST_FREQUENCY;
+            const percentage = (timeFreq - band.min) / range * 100;
+            marker.style.left = `${percentage}%`;
+            marker.style.top = '25px';
+            marker.style.color = 'rgba(255, 165, 0, 0.9)';
+            marker.style.fontSize = '12px';
+            marker.style.fontWeight = 'bold';
+            marker.style.textShadow = '0 0 3px rgba(255, 165, 0, 0.8)';
+            marker.style.transform = 'translateX(-50%)';
+            marker.style.whiteSpace = 'nowrap';
+            marker.textContent = `${timeFreq} MHz (TIME&ISS)`;
+            marker.style.animation = 'pulse 2s infinite';
+            container.appendChild(marker);
+        }
+    }
+    function updateFrequencyIndicatorPosition() {
+        const band = Constants.BANDS[State.get('currentBandIndex')];
+        const range = band.max - band.min;
+        const percentage = (State.get('currentFrequency') - band.min) / range;
+        DOM.updateStyle('frequencyIndicator', 'left', `${percentage * 100}%`);
+        DOM.updateStyle('frequencyIndicator', 'zIndex', '100');
+        updateFrequencyScalePosition(percentage);
+    }
+    function resetWaterfallPosition() {
+        const waterfall = State.get('waterfallChart');
+        if (waterfall) {
+            waterfall.scrollOffset = 0;
+            waterfall.visibleRange = { start: 0, end: 1 };
+            updateFrequencyScalePosition(0);
+        }
+    }
+    function scrollWaterfall(percentage) {
+        const waterfall = State.get('waterfallChart');
+        if (!waterfall) return;
+        const visibleWidth = 0.7;
+        let start = percentage * (1 - visibleWidth);
+        start = Math.max(0, Math.min(1 - visibleWidth, start));
+        waterfall.visibleRange = { start, end: start + visibleWidth };
+        updateFrequencyScalePosition(percentage);
+    }
+    function updateFrequencyScalePosition(percentage) {
+        const scale = DOM.get('frequencyScale');
+        const canvas = DOM.get('waterfallCanvas');
+        if (!scale || !canvas) return;
+        DOM.updateStyle('frequencyScale', 'width', `${canvas.offsetWidth}px`);
+        DOM.updateStyle('frequencyScale', 'transform', `translateX(0px)`);
+    }
+    function createFrequencyScale() {
+        const scale = DOM.get('frequencyScale');
+        const canvas = DOM.get('waterfallCanvas');
+        if (!scale || !canvas) return;
+        scale.innerHTML = '';
+        const band = Constants.BANDS[State.get('currentBandIndex')];
+        const range = band.max - band.min;
+        const stepSize = 0.001;
+        const totalWidth = canvas.offsetWidth;
+        DOM.updateStyle('frequencyScale', 'width', `${totalWidth}px`);
+        for (let freq = band.min; freq <= band.max; freq += stepSize) {
+            const roundedFreq = parseFloat(freq.toFixed(3));
+            const marker = document.createElement('div');
+            marker.className = 'scale-marker';
+            if (band.name === Constants.TIME_BROADCAST_BAND &&
+                Math.abs(roundedFreq - Constants.TIME_BROADCAST_FREQUENCY) < Constants.SIGNAL_PROCESSING.FREQUENCY_TOLERANCE) {
+                marker.classList.add('time-broadcast-marker');
+                marker.style.animation = 'pulse 2s infinite';
+            }
+            const percentage = (roundedFreq - band.min) / range * 100;
+            marker.style.left = `${percentage}%`;
+            marker.style.position = 'absolute';
+            marker.style.top = '5px';
+            marker.style.color = 'rgba(0, 255, 0, 0.7)';
+            marker.style.fontSize = '12px';
+            marker.style.textShadow = '0 0 3px rgba(0, 255, 0, 0.8)';
+            marker.style.transform = 'translateX(-50%)';
+            marker.style.whiteSpace = 'nowrap';
+            const label = document.createElement('span');
+            label.textContent = roundedFreq.toFixed(3);
+            marker.appendChild(label);
+            scale.appendChild(marker);
+        }
+    }
+    function setKnobRotation(knobName, degrees) {
+        const knob = DOM.get(knobName);
+        if (knob) knob.style.transform = `rotate(${degrees}deg)`;
+    }
+    function updateFrequencyDisplay() {
+        DOM.updateText('frequencyDigits', `${State.get('currentFrequency').toFixed(3)} MHz`);
+    }
+    function updateToneDisplay() {
+        DOM.updateText('toneValue', `${State.get('toneFrequency')} Hz`);
+    }
+    function updateVolumeDisplay() {
+        const percentage = Math.round(State.get('volume') * 100);
+        DOM.updateText('volumeValue', `${percentage}%`);
+    }
+    function updateSearchStatus(message) {
+        DOM.updateText('searchStatus', message);
+    }
+    function updateSearchProgress(percentage) {
+        DOM.updateStyle('searchProgress', 'width', `${percentage}%`);
+    }
+    function continueSearch() {
+        let nextBandIndex = State.get('searchBandIndex') + 1;
+        if (nextBandIndex >= Constants.BANDS.length) {
+            completeSearch();
+            return;
+        }
+        State.set('searchBandIndex', nextBandIndex);
+        updateSearchStatus(`正在扫描 ${Constants.BANDS[nextBandIndex].name} 波段...`);
+        updateSearchProgress((nextBandIndex / Constants.BANDS.length) * 100);
+        Network.connectToBand(nextBandIndex);
+    }
+    function searchForSignals() {
+        if (State.get('isSearching')) return;
+        State.set('previousBandIndex', State.get('currentBandIndex'));
+        State.set('previousFrequency', State.get('currentFrequency'));
+        State.set('isSearching', true);
+        State.set('searchBandIndex', 0);
+        State.set('foundSignal', null);
+        const searchBtn = DOM.get('searchButton');
+        if (searchBtn) {
+            searchBtn.disabled = true;
+        }
+        const modal = DOM.get('searchModal');
+        if (modal) {
+            modal.style.display = 'flex';
+            updateSearchStatus(`开始扫描 ${Constants.BANDS[0].name} 波段...`);
+            updateSearchProgress(0);
+            setTimeout(() => modal.classList.add('show'), 10);
+        }
+        Network.connectToBand(0);
+    }
+    function completeSearch() {
+        if (!State.get('isSearching')) return;
+        setTimeout(() => {
+            const foundSignal = State.get('foundSignal');
+            if (foundSignal) {
+                State.set('currentBandIndex', foundSignal.bandIndex);
+                State.set('currentFrequency', foundSignal.frequency);
+                Audio.updateQrmTone();
+                updateFrequencyDisplay();
+                updateFrequencyIndicatorPosition();
+                resetFrequencyKnobRotation();
+                updateSearchStatus(`已切换到 ${Constants.BANDS[foundSignal.bandIndex].name} 的信号频率`);
+                Network.connectToBand(foundSignal.bandIndex);
+            } else {
+                const prevBandIndex = State.get('previousBandIndex');
+                const prevFrequency = State.get('previousFrequency');
+                State.set('currentBandIndex', prevBandIndex);
+                State.set('currentFrequency', prevFrequency);
+                Audio.updateQrmTone();
+                updateFrequencyDisplay();
+                updateFrequencyIndicatorPosition();
+                resetFrequencyKnobRotation();
+                Network.connectToBand(prevBandIndex);
+                updateSearchStatus('未找到任何信号，已恢复到原始频率');
+                DOM.toggleClass('noSignalMessage', 'hidden', false);
+            }
+            setTimeout(() => {
+                const modal = DOM.get('searchModal');
+                if (modal) {
+                    modal.classList.remove('show');
+                    setTimeout(() => {
+                        modal.style.display = 'none';
+                        const searchBtn = DOM.get('searchButton');
+                        if (searchBtn) {
+                            searchBtn.disabled = false;
+                        }
+                        State.set('isSearching', false);
+                        State.set('foundSignal', null);
+                    }, 300);
+                }
+            }, 2000);
+        }, 500);
+    }
+    function setupEventListeners() {
+        document.body.focus();
+        const bandSelect = DOM.get('bandSelect');
+        if (bandSelect) {
+            bandSelect.addEventListener('change', (e) => {
+                const newIndex = parseInt(e.target.value);
+                if (newIndex !== State.get('currentBandIndex')) {
+                    Audio.stopTransmitting();
+                    Network.connectToBand(newIndex);
+                }
+            });
+        }
+        const freqKnob = DOM.get('frequencyKnob');
+        if (freqKnob) {
+            freqKnob.addEventListener('mousedown', (e) => {
+                if (State.get('isSearching') || State.get('isTransmitting')) return;
+                State.set('isDraggingFrequency', true);
+                const rect = freqKnob.getBoundingClientRect();
+                const centerX = rect.width / 2;
+                const centerY = rect.height / 2;
+                const mouseX = e.clientX - rect.left - centerX;
+                const mouseY = e.clientY - rect.top - centerY;
+                let startAngle = Math.atan2(mouseY, mouseX) * (180 / Math.PI);
+                startAngle = (startAngle + 360) % 360;
+                startAngle = (startAngle + 90) % 360;
+                State.set('startAngle', startAngle);
+            });
+            freqKnob.addEventListener('touchstart', (e) => {
+                if (State.get('isSearching') || State.get('isTransmitting') || e.touches.length !== 1) return;
+                e.preventDefault();
+                State.set('isDraggingFrequency', true);
+                const rect = freqKnob.getBoundingClientRect();
+                const centerX = rect.width / 2;
+                const centerY = rect.height / 2;
+                const touchX = e.touches[0].clientX - rect.left - centerX;
+                const touchY = e.touches[0].clientY - rect.top - centerY;
+                let startAngle = Math.atan2(touchY, touchX) * (180 / Math.PI);
+                startAngle = (startAngle + 360) % 360;
+                startAngle = (startAngle + 90) % 360;
+                State.set('startAngle', startAngle);
+            }, { passive: false });
+        }
+        const volKnob = DOM.get('volumeKnob');
+        if (volKnob) {
+            volKnob.addEventListener('mousedown', (e) => {
+                State.set('isDraggingVolume', true);
+                const rect = volKnob.getBoundingClientRect();
+                const centerX = rect.width / 2;
+                const centerY = rect.height / 2;
+                const mouseX = e.clientX - rect.left - centerX;
+                const mouseY = e.clientY - rect.top - centerY;
+                let startAngle = Math.atan2(mouseY, mouseX) * (180 / Math.PI);
+                startAngle = (startAngle + 360) % 360;
+                startAngle = (startAngle + 90) % 360;
+                State.set('startAngle', startAngle);
+            });
+            volKnob.addEventListener('touchstart', (e) => {
+                if (e.touches.length !== 1) return;
+                e.preventDefault();
+                State.set('isDraggingVolume', true);
+                const rect = volKnob.getBoundingClientRect();
+                const centerX = rect.width / 2;
+                const centerY = rect.height / 2;
+                const touchX = e.touches[0].clientX - rect.left - centerX;
+                const touchY = e.touches[0].clientY - rect.top - centerY;
+                let startAngle = Math.atan2(touchY, touchX) * (180 / Math.PI);
+                startAngle = (startAngle + 360) % 360;
+                startAngle = (startAngle + 90) % 360;
+                State.set('startAngle', startAngle);
+            }, { passive: false });
+        }
+ 
+        const toneKnob = DOM.get('toneKnob');
+        if (toneKnob) {
+            toneKnob.addEventListener('mousedown', (e) => {
+                State.set('isDraggingTone', true);
+                const rect = toneKnob.getBoundingClientRect();
+                const centerX = rect.width / 2;
+                const centerY = rect.height / 2;
+                const mouseX = e.clientX - rect.left - centerX;
+                const mouseY = e.clientY - rect.top - centerY;
+         
+                let startAngle = Math.atan2(mouseY, mouseX) * (180 / Math.PI);
+                startAngle = (startAngle + 360) % 360;
+                startAngle = (startAngle + 90) % 360;
+                State.set('startAngle', startAngle);
+            });
+      
+            toneKnob.addEventListener('touchstart', (e) => {
+                if (e.touches.length !== 1) return;
+                e.preventDefault();
+          
+                State.set('isDraggingTone', true);
+                const rect = toneKnob.getBoundingClientRect();
+                const centerX = rect.width / 2;
+                const centerY = rect.height / 2;
+                const touchX = e.touches[0].clientX - rect.left - centerX;
+                const touchY = e.touches[0].clientY - rect.top - centerY;
+          
+                let startAngle = Math.atan2(touchY, touchX) * (180 / Math.PI);
+                startAngle = (startAngle + 360) % 360;
+                startAngle = (startAngle + 90) % 360;
+                State.set('startAngle', startAngle);
+            }, { passive: false });
+        }
+
+        document.addEventListener('mousemove', (e) => {
+            if (State.get('isDraggingFrequency')) {
+                KnobHandler.updateKnob('frequency', e);
+            } else if (State.get('isDraggingVolume')) {
+                KnobHandler.updateKnob('volume', e);
+            } else if (State.get('isDraggingTone')) {
+                KnobHandler.updateKnob('tone', e);
+            }
+        });
+
+        document.addEventListener('touchmove', (e) => {
+            if (State.get('isDraggingFrequency')) {
+                e.preventDefault();
+                KnobHandler.updateKnob('frequency', e, true);
+            } else if (State.get('isDraggingVolume')) {
+                e.preventDefault();
+                KnobHandler.updateKnob('volume', e, true);
+            } else if (State.get('isDraggingTone')) {
+                e.preventDefault();
+                KnobHandler.updateKnob('tone', e, true);
+            }
+        }, { passive: false });
+
+        document.addEventListener('mouseup', () => {
+            State.update({
+                isDraggingFrequency: false,
+                isDraggingVolume: false,
+                isDraggingTone: false
+            });
+        });
+
+        document.addEventListener('touchend', () => {
+            State.update({
+                isDraggingFrequency: false,
+                isDraggingVolume: false,
+                isDraggingTone: false
+            });
+        });
+
+        document.addEventListener('touchcancel', () => {
+            State.update({
+                isDraggingFrequency: false,
+                isDraggingVolume: false,
+                isDraggingTone: false
+            });
+        });
+
+        document.addEventListener('mouseleave', () => {
+            State.update({
+                isDraggingFrequency: false,
+                isDraggingVolume: false,
+                isDraggingTone: false
+            });
+        });
+
+        const canvas = DOM.get('waterfallCanvas');
+        if (canvas) {
+            canvas.addEventListener('click', (e) => {
+                if (State.get('isSearching') || State.get('isTransmitting')) return;
+
+                const rect = canvas.getBoundingClientRect();
+                const clickX = e.clientX - rect.left;
+                const percentage = clickX / rect.width;
+
+                const band = Constants.BANDS[State.get('currentBandIndex')];
+                const range = band.max - band.min;
+                const visibleRange = State.get('waterfallChart')?.visibleRange || { start: 0, end: 1 };
+                const visibleWidth = visibleRange.end - visibleRange.start;
+                const adjustedPercentage = visibleRange.start + (percentage * visibleWidth);
+
+                const newFrequency = parseFloat((band.min + (adjustedPercentage * range)).toFixed(3));
+
+                State.set('currentFrequency', newFrequency);
+                Audio.updateQrmTone();
+                Audio.stopTransmitting();
+                updateFrequencyDisplay();
+                updateFrequencyIndicatorPosition();
+                resetFrequencyKnobRotation();
+            });
+        }
+
+        const muteBtn = DOM.get('muteButton');
+        if (muteBtn) {
+            muteBtn.addEventListener('click', Audio.toggleMute);
+        }
+
+        const testBtn = DOM.get('testAudioButton');
+        if (testBtn) {
+            testBtn.addEventListener('click', Audio.playTestTone);
+        }
+
+        const morseKey = DOM.get('morseKey');
+        if (morseKey) {
+            morseKey.addEventListener('contextmenu', (e) => { e.preventDefault(); });
+            morseKey.addEventListener('mousedown', async (e) => {
+                await Audio.userGestureResume();
+                State.set('pendingRelease', false);
+                if (State.get('isManualMode')) {
+                    if (!State.get('isMuted') && !State.get('isSearching') && !State.get('isTransmitting')) {
+                        await Audio.startTransmitting();
+                    }
+                } else {
+                    if (e.button === 0) {
+                        Keyer.setPaddle('dot', true);
+                    } else if (e.button === 2) {
+                        Keyer.setPaddle('dash', true);
+                    }
+                }
+            });
+            morseKey.addEventListener('mouseup', async (e) => {
+
+                if (!State.get('audioContext') || State.get('audioContext').state === 'suspended') {
+                    State.set('pendingRelease', true);
+                    await Audio.userGestureResume();
+                }
+                if (State.get('pendingRelease')) {
+                    State.set('pendingRelease', false);
+                    if (State.get('isManualMode')) {
+                        Audio.stopTransmitting();
+                        State.set('isLongPressBlocked', false);
+                    }
+                    return;
+                }
+                if (State.get('isManualMode')) {
+                    Audio.stopTransmitting();
+                    State.set('isLongPressBlocked', false);
+                } else {
+                    if (e.button === 0) {
+                        Keyer.setPaddle('dot', false);
+                    } else if (e.button === 2) {
+                        Keyer.setPaddle('dash', false);
+                    }
+                }
+            });
+            morseKey.addEventListener('mouseleave', async () => {
+                if (!State.get('audioContext') || State.get('audioContext').state === 'suspended') {
+                    State.set('pendingRelease', true);
+                    await Audio.userGestureResume();
+                }
+                if (State.get('pendingRelease')) {
+                    State.set('pendingRelease', false);
+                    if (State.get('isManualMode')) {
+                        Audio.stopTransmitting();
+                    }
+                    return;
+                }
+                if (State.get('isManualMode')) {
+                    Audio.stopTransmitting();
+                }
+            });
+            morseKey.addEventListener('touchstart', async (e) => {
+                e.preventDefault();
+                await Audio.userGestureResume();
+                State.set('pendingRelease', false);
+                if (State.get('isManualMode')) {
+                    if (!State.get('isMuted') && !State.get('isSearching') && !State.get('isTransmitting')) {
+                        await Audio.startTransmitting();
+                    }
+                } else {
+                    Keyer.setPaddle('dot', true);
+                }
+            }, { passive: false });
+            morseKey.addEventListener('touchend', async (e) => {
+                e.preventDefault();
+                if (!State.get('audioContext') || State.get('audioContext').state === 'suspended') {
+                    State.set('pendingRelease', true);
+                    await Audio.userGestureResume();
+                }
+                if (State.get('pendingRelease')) {
+                    State.set('pendingRelease', false);
+                    if (State.get('isManualMode')) {
+                        Audio.stopTransmitting();
+                        State.set('isLongPressBlocked', false);
+                    }
+                    return;
+                }
+                if (State.get('isManualMode')) {
+                    Audio.stopTransmitting();
+                    State.set('isLongPressBlocked', false);
+                } else {
+                    Keyer.setPaddle('dot', false);
+                }
+            }, { passive: false });
+            morseKey.addEventListener('touchcancel', async (e) => {
+                e.preventDefault();
+                if (!State.get('audioContext') || State.get('audioContext').state === 'suspended') {
+                    State.set('pendingRelease', true);
+                    await Audio.userGestureResume();
+                }
+                if (State.get('pendingRelease')) {
+                    State.set('pendingRelease', false);
+                    if (State.get('isManualMode')) {
+                        Audio.stopTransmitting();
+                    }
+                    return;
+                }
+                if (State.get('isManualMode')) {
+                    Audio.stopTransmitting();
+                }
+            }, { passive: false });
+        }
+
+        document.addEventListener('keydown', async (e) => {
+            if (e.code === 'Space' && State.get('isManualMode')) {
+                e.preventDefault();
+                await Audio.userGestureResume();
+                State.set('pendingRelease', false);
+                if (!State.get('isMuted') && !State.get('isSearching') && !State.get('isTransmitting')) {
+                    await Audio.startTransmitting();
+                }
+            }
+            if (!State.get('isManualMode')) {
+                if (e.key === ',') {
+                    e.preventDefault();
+                    await Audio.userGestureResume();
+                    Keyer.setPaddle('dot', true);
+                } else if (e.key === '.') {
+                    e.preventDefault();
+                    await Audio.userGestureResume();
+                    Keyer.setPaddle('dash', true);
+                } else if (e.code === 'ArrowLeft') {
+                    e.preventDefault();
+                    await Audio.userGestureResume();
+                    Keyer.setPaddle('dot', true);
+                } else if (e.code === 'ArrowRight') {
+                    e.preventDefault();
+                    await Audio.userGestureResume();
+                    Keyer.setPaddle('dash', true);
+                }
+            }
+            if (e.code === 'KeyT' && Constants.BANDS[State.get('currentBandIndex')].name === Constants.TIME_BROADCAST_BAND && !State.get('isTransmitting')) {
+                e.preventDefault();
+                await Audio.userGestureResume();
+                State.set('currentFrequency', Constants.TIME_BROADCAST_FREQUENCY);
+                Audio.updateQrmTone();
+                Audio.stopTransmitting();
+                updateFrequencyDisplay();
+                updateFrequencyIndicatorPosition();
+                resetFrequencyKnobRotation();
+            }
+            if (e.code === 'KeyA') {
+                e.preventDefault();
+                await Audio.userGestureResume();
+                Audio.playTestTone();
+            }
+        });
+        document.addEventListener('keyup', async (e) => {
+            if (e.code === 'Space' && State.get('isManualMode')) {
+                e.preventDefault();
+                if (!State.get('audioContext') || State.get('audioContext').state === 'suspended') {
+                    State.set('pendingRelease', true);
+                    await Audio.userGestureResume();
+                }
+                if (State.get('pendingRelease')) {
+                    State.set('pendingRelease', false);
+                    Audio.stopTransmitting();
+                    State.set('isLongPressBlocked', false);
+                    return;
+                }
+                Audio.stopTransmitting();
+                State.set('isLongPressBlocked', false);
+            }
+            if (!State.get('isManualMode')) {
+                if (e.key === ',') {
+                    e.preventDefault();
+                    await Audio.userGestureResume();
+                    Keyer.setPaddle('dot', false);
+                } else if (e.key === '.') {
+                    e.preventDefault();
+                    await Audio.userGestureResume();
+                    Keyer.setPaddle('dash', false);
+                } else if (e.code === 'ArrowLeft') {
+                    e.preventDefault();
+                    await Audio.userGestureResume();
+                    Keyer.setPaddle('dot', false);
+                } else if (e.code === 'ArrowRight') {
+                    e.preventDefault();
+                    await Audio.userGestureResume();
+                    Keyer.setPaddle('dash', false);
+                }
+            }
+        });
+
+        const searchBtn = DOM.get('searchButton');
+        if (searchBtn) {
+            searchBtn.addEventListener('click', searchForSignals);
+        }
+
+        window.addEventListener('resize', () => {
+            const canvas = DOM.get('waterfallCanvas');
+            if (canvas) {
+                canvas.width = canvas.offsetWidth;
+                canvas.height = canvas.offsetHeight;
+                const waterfall = State.get('waterfallChart');
+                if (waterfall) {
+                    waterfall.width = canvas.width;
+                    waterfall.height = canvas.height;
+                    waterfall.initBuffer();
+                }
+                createFrequencyScale();
+                createWaterfallMarkers();
+                updateFrequencyIndicatorPosition();
+            }
+        });
+
+        window.addEventListener('beforeunload', () => {
+            Network.cleanupConnections();
+
+            const scrollRaf = State.get('scrollRaf');
+            if (scrollRaf) cancelAnimationFrame(scrollRaf);
+
+            const transmitInterval = State.get('transmitInterval');
+            if (transmitInterval) clearInterval(transmitInterval);
+
+            Audio.stopTransmitting();
+
+            const signals = State.get('activeRemoteSignals');
+            signals.forEach((signal, id) => {
+                if (signal.renderInterval) clearInterval(signal.renderInterval);
+                Audio.stopReceivedTone(id);
+            });
+            Keyer.stop();
+            State.clearTimers();
+        });
+        const modeToggle = DOM.get('modeToggle');
+        const wpmSlider = DOM.get('wpmSlider');
+        const wpmGroup = DOM.get('wpmGroup');
+        const modeLabel = DOM.get('modeLabel');
+        const wpmValue = DOM.get('wpmValue');
+        if (modeToggle && wpmSlider && wpmGroup && modeLabel && wpmValue) {
+            modeToggle.addEventListener('change', () => {
+                const manual = !modeToggle.checked;
+                State.set('isManualMode', manual);
+                DOM.toggleClass('wpmGroup', 'hidden', manual);
+                DOM.toggleClass('keyHintManual', 'hidden', !manual);
+                DOM.toggleClass('keyHintAuto', 'hidden', manual);
+                DOM.toggleClass('morseKey', 'hidden', !manual);
+                DOM.toggleClass('paddleKeyer', 'hidden', manual);
+                modeLabel.textContent = manual ? '手动' : '自动键';
+                if (manual) Keyer.stop();
+            });
+            wpmSlider.addEventListener('input', () => {
+                const val = parseInt(wpmSlider.value);
+                State.set('wpm', val);
+                wpmValue.textContent = String(val);
+            });
+        }
+        const paddleLeft = document.getElementById('paddleLeft');
+        const paddleRight = document.getElementById('paddleRight');
+        const paddleArea = document.getElementById('paddleArea');
+        if (paddleLeft && paddleRight && paddleArea) {
+            let leftPressed = false;
+            let rightPressed = false;
+            const setVisual = (leftOn, rightOn) => {
+                if (leftOn) paddleLeft.classList.add('active'); else paddleLeft.classList.remove('active');
+                if (rightOn) paddleRight.classList.add('active'); else paddleRight.classList.remove('active');
+            };
+            paddleArea.addEventListener('contextmenu', (e) => { e.preventDefault(); });
+            let mouseEngaged = false;
+            const updateFromButtons = (buttons) => {
+                if (State.get('isManualMode')) return;
+                const leftOn = (buttons & 1) === 1;
+                const rightOn = (buttons & 2) === 2;
+                Keyer.setPaddle('dot', leftOn);
+                Keyer.setPaddle('dash', rightOn);
+                setVisual(leftOn, rightOn);
+            };
+            paddleArea.addEventListener('mousedown', (e) => {
+                if (State.get('isManualMode')) return;
+                e.preventDefault();
+                mouseEngaged = true;
+                updateFromButtons(e.buttons);
+            });
+            document.addEventListener('mousemove', (e) => {
+                if (!mouseEngaged) return;
+                updateFromButtons(e.buttons);
+            });
+            document.addEventListener('mouseup', (e) => {
+                if (!mouseEngaged) return;
+                updateFromButtons(e.buttons);
+                if ((e.buttons & 3) === 0) {
+                    mouseEngaged = false;
+                    setVisual(false, false);
+                }
+            });
+            if (paddleLeft) {
+                paddleLeft.addEventListener('touchstart', (e) => {
+                    if (State.get('isManualMode')) return;
+                    e.preventDefault();
+                    leftPressed = true;
+                    Keyer.setPaddle('dot', true);
+                    setVisual(leftPressed, rightPressed);
+                }, { passive: false });
+                paddleLeft.addEventListener('touchend', (e) => {
+                    if (State.get('isManualMode')) return;
+                    e.preventDefault();
+                    leftPressed = false;
+                    Keyer.setPaddle('dot', false);
+                    setVisual(leftPressed, rightPressed);
+                }, { passive: false });
+                paddleLeft.addEventListener('touchcancel', (e) => {
+                    if (State.get('isManualMode')) return;
+                    e.preventDefault();
+                    leftPressed = false;
+                    Keyer.setPaddle('dot', false);
+                    setVisual(leftPressed, rightPressed);
+                }, { passive: false });
+            }
+            if (paddleRight) {
+                paddleRight.addEventListener('touchstart', (e) => {
+                    if (State.get('isManualMode')) return;
+                    e.preventDefault();
+                    rightPressed = true;
+                    Keyer.setPaddle('dash', true);
+                    setVisual(leftPressed, rightPressed);
+                }, { passive: false });
+                paddleRight.addEventListener('touchend', (e) => {
+                    if (State.get('isManualMode')) return;
+                    e.preventDefault();
+                    rightPressed = false;
+                    Keyer.setPaddle('dash', false);
+                    setVisual(leftPressed, rightPressed);
+                }, { passive: false });
+                paddleRight.addEventListener('touchcancel', (e) => {
+                    if (State.get('isManualMode')) return;
+                    e.preventDefault();
+                    rightPressed = false;
+                    Keyer.setPaddle('dash', false);
+                    setVisual(leftPressed, rightPressed);
+                }, { passive: false });
+            }
+        }
+
+        createNoiseControls();
+    }
+    function createNoiseControls() {
+
+        const container = document.createElement('div');
+        container.className = 'noise-controls';
+
+        const qrnRow = document.createElement('div');
+        qrnRow.className = 'control-row';
+
+        const qrnLabel = document.createElement('label');
+        qrnLabel.textContent = '自然噪声 (QRN): ';
+
+        const qrnSlider = document.createElement('input');
+        qrnSlider.type = 'range';
+        qrnSlider.min = '0';
+        qrnSlider.max = '1';
+        qrnSlider.step = '0.01';
+        qrnSlider.value = Constants.NOISE.QRN_LEVEL;
+        qrnSlider.oninput = function() {
+            Constants.NOISE.QRN_LEVEL = parseFloat(this.value);
+            const noiseGain = State.get('noiseGain');
+            if (noiseGain) {
+                noiseGain.gain.value = Constants.NOISE.QRN_LEVEL;
+            }
+        };
+
+        qrnRow.appendChild(qrnLabel);
+        qrnRow.appendChild(qrnSlider);
+
+        const qrmRow = document.createElement('div');
+        qrmRow.className = 'control-row';
+
+        const qrmLabel = document.createElement('label');
+        qrmLabel.textContent = '人为干扰 (QRM): ';
+
+        const qrmSlider = document.createElement('input');
+        qrmSlider.type = 'range';
+        qrmSlider.min = '0';
+        qrmSlider.max = '1';
+        qrmSlider.step = '0.01';
+        qrmSlider.value = Constants.NOISE.QRM_LEVEL;
+        qrmSlider.oninput = function() {
+            Constants.NOISE.QRM_LEVEL = parseFloat(this.value);
+            const qrmGain = State.get('qrmGain');
+            if (qrmGain && State.get('isQrmActive')) {
+                qrmGain.gain.value = Constants.NOISE.QRM_LEVEL;
+            }
+        };
+
+        qrmRow.appendChild(qrmLabel);
+        qrmRow.appendChild(qrmSlider);
+
+        const qsbRow = document.createElement('div');
+        qsbRow.className = 'control-row';
+
+        const qsbLabel = document.createElement('label');
+        qsbLabel.textContent = '信号衰落 (QSB): ';
+
+        const qsbSlider = document.createElement('input');
+        qsbSlider.type = 'range';
+        qsbSlider.min = '0';
+        qsbSlider.max = '1';
+        qsbSlider.step = '0.01';
+        qsbSlider.value = Constants.NOISE.QSB_DEPTH;
+        qsbSlider.oninput = function() {
+            Constants.NOISE.QSB_DEPTH = parseFloat(this.value);
+        };
+
+        qsbRow.appendChild(qsbLabel);
+        qsbRow.appendChild(qsbSlider);
+
+        container.appendChild(qrnRow);
+        container.appendChild(qrmRow);
+        container.appendChild(qsbRow);
+
+        const leftControls = document.querySelector('.control-section.left-controls');
+        if (leftControls) {
+            leftControls.appendChild(container);
+        } else {
+            document.body.appendChild(container);
+        }
+    }
+    function showReminderModal() {
+        const modal = DOM.get('reminderModal');
+        if (modal) {
+            modal.classList.add('show');
+        }
+    }
+    function hideReminderModal() {
+        const modal = DOM.get('reminderModal');
+        if (modal) {
+            modal.classList.remove('show');
+            localStorage.setItem('cw_reminder_shown', '1');
+        }
+    }
+    return {
+        updateConnectionStatus, populateBandSelect, resetFrequencyKnobRotation,
+        createWaterfallMarkers, updateFrequencyIndicatorPosition,
+        resetWaterfallPosition, createFrequencyScale, updateFrequencyDisplay,
+        updateToneDisplay, updateVolumeDisplay, setupEventListeners,
+        updateSearchStatus, updateSearchProgress, continueSearch, completeSearch,
+        showReminderModal, hideReminderModal, setKnobRotation
+    };
+})();
+
+function init() {
+    State.init();
+    UI.populateBandSelect();
+    UI.setupEventListeners();
+    Keyer.init();
+    Waterfall.init();
+    Audio.init();
+    Network.connectToBand(State.get('currentBandIndex'));
+    setInterval(SignalProcessor.cleanupAndCheckTimeouts, 1000);
+
+    UI.showReminderModal();
+    const rogerBtn = DOM.get('rogerButton');
+    if (rogerBtn) {
+        rogerBtn.onclick = async () => {
+            await Audio.userGestureResume();
+            UI.hideReminderModal();
+        };
+    }
+}
+window.addEventListener('load', init);
+
+const Keyer = (() => {
+    function msPerDit() {
+        const wpm = State.get('wpm') || 20;
+        return Math.max(20, Math.round(1200 / wpm));
+    }
+    function scheduleNext() {
+        const keyer = State.get('keyer');
+        if (!keyer.running) return;
+        const dot = keyer.paddleDotPressed;
+        const dash = keyer.paddleDashPressed;
+        if (!dot && !dash) {
+            const timer = setTimeout(scheduleNext, msPerDit() / 2);
+            keyer.loopTimer = timer;
+            State.addTimer(timer);
+            State.set('keyer', keyer);
+            return;
+        }
+        let sendDot;
+        if (dot && dash) {
+            sendDot = keyer.nextIsDot;
+            keyer.nextIsDot = !keyer.nextIsDot;
+        } else if (dot) {
+            sendDot = true;
+        } else {
+            sendDot = false;
+        }
+        State.set('keyer', keyer);
+        const dit = msPerDit();
+        const dah = dit * 3;
+        const elem = sendDot ? dit : dah;
+        if (!State.get('isMuted') && !State.get('isSearching')) {
+            Audio.startTransmitting();
+        }
+        const timer = setTimeout(() => {
+            if (State.get('isTransmitting')) Audio.stopTransmitting();
+            const keyer2 = State.get('keyer');
+            const nextTimer = setTimeout(scheduleNext, dit);
+            keyer2.loopTimer = nextTimer;
+            State.addTimer(nextTimer);
+            State.set('keyer', keyer2);
+            State.get('timers').delete(timer);
+        }, elem);
+        State.addTimer(timer);
+    }
+    function setPaddle(which, pressed) {
+        const keyer = State.get('keyer');
+        if (which === 'dot') keyer.paddleDotPressed = pressed;
+        else keyer.paddleDashPressed = pressed;
+        State.set('keyer', keyer);
+        if (!State.get('isManualMode')) {
+            const left = document.getElementById('paddleLeft');
+            const right = document.getElementById('paddleRight');
+            if (left) (keyer.paddleDotPressed ? left.classList.add('active') : left.classList.remove('active'));
+            if (right) (keyer.paddleDashPressed ? right.classList.add('active') : right.classList.remove('active'));
+        }
+        if (!State.get('isManualMode')) {
+            start();
+        }
+        if (!pressed && State.get('isManualMode')) {
+            Audio.stopTransmitting();
+        }
+    }
+    function start() {
+        const keyer = State.get('keyer');
+        if (keyer.running) return;
+        keyer.running = true;
+        State.set('keyer', keyer);
+        scheduleNext();
+    }
+    function stop() {
+        const keyer = State.get('keyer');
+        keyer.running = false;
+        if (keyer.loopTimer) {
+            clearTimeout(keyer.loopTimer);
+            State.get('timers').delete(keyer.loopTimer);
+            keyer.loopTimer = null;
+        }
+        if (keyer.gapTimer) {
+            clearTimeout(keyer.gapTimer);
+            State.get('timers').delete(keyer.gapTimer);
+            keyer.gapTimer = null;
+        }
+        keyer.paddleDotPressed = false;
+        keyer.paddleDashPressed = false;
+        State.set('keyer', keyer);
+        const left = document.getElementById('paddleLeft');
+        const right = document.getElementById('paddleRight');
+        if (left) left.classList.remove('active');
+        if (right) right.classList.remove('active');
+        if (State.get('isTransmitting')) Audio.stopTransmitting();
+    }
+    function init() {
+        const modeToggle = DOM.get('modeToggle');
+        if (modeToggle) modeToggle.checked = !State.get('isManualMode');
+        const wpmSlider = DOM.get('wpmSlider');
+        const wpmValue = DOM.get('wpmValue');
+        if (wpmSlider) wpmSlider.value = String(State.get('wpm'));
+        if (wpmValue) wpmValue.textContent = String(State.get('wpm'));
+        DOM.toggleClass('wpmGroup', 'hidden', State.get('isManualMode'));
+        DOM.toggleClass('keyHintManual', 'hidden', !State.get('isManualMode'));
+        DOM.toggleClass('keyHintAuto', 'hidden', State.get('isManualMode'));
+        DOM.toggleClass('morseKey', 'hidden', !State.get('isManualMode'));
+        DOM.toggleClass('paddleKeyer', 'hidden', State.get('isManualMode'));
+        const modeLabel = DOM.get('modeLabel');
+        if (modeLabel) modeLabel.textContent = State.get('isManualMode') ? '手动' : '自动键';
+    }
+    return { init, start, stop, setPaddle };
+})();
